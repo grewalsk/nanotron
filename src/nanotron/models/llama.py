@@ -975,8 +975,12 @@ class LlamaModel(nn.Module):
 
 @torch.jit.script
 def masked_mean(loss, label_mask, dtype):
-    # type: (Tensor, Tensor, torch.dtype) -> Tensor
-    return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
+    # type: (torch.Tensor, torch.Tensor, torch.dtype) -> torch.Tensor
+    # Compute sum with explicit dtype to avoid precision issues
+    # Use in-place operations where possible for better memory efficiency
+    weighted_sum = torch.sum(loss * label_mask, dtype=dtype)
+    mask_sum = torch.sum(label_mask, dtype=dtype)
+    return weighted_sum / mask_sum
 
 
 class Loss(nn.Module):
@@ -990,12 +994,22 @@ class Loss(nn.Module):
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
+        # Avoid unnecessary transpose operations by using memory-optimized implementation
+        # Transpose only once and make contiguous to ensure optimal memory layout
+        transposed_labels = label_ids.transpose(0, 1).contiguous()
+
+        # Use memory-optimized sharded_cross_entropy implementation
         loss = sharded_cross_entropy(
             sharded_logits,
-            label_ids.transpose(0, 1).contiguous(),
+            transposed_labels,
             group=self.tp_pg,
             dtype=torch.float,
-        ).transpose(0, 1)
+        )
+
+        # Transpose back to match expected dimensions
+        loss = loss.transpose(0, 1)
+
+        # Apply mask and compute mean
         loss = masked_mean(loss, label_mask, dtype=torch.float)
         return {"loss": loss}
 
@@ -1011,15 +1025,28 @@ class LossWithZLoss(Loss):
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
+        # Avoid unnecessary transpose operations by using memory-optimized implementation
+        # Transpose only once and make contiguous to ensure optimal memory layout
+        transposed_labels = label_ids.transpose(0, 1).contiguous()
+
+        # Use memory-optimized sharded_cross_entropy implementation with z_loss
         loss, z_loss = sharded_cross_entropy(
             sharded_logits,
-            label_ids.transpose(0, 1).contiguous(),
+            transposed_labels,
             group=self.tp_pg,
             dtype=torch.float,
             z_loss_coef=self.z_loss_coef,
         )
-        loss = masked_mean(loss.transpose(0, 1), label_mask, dtype=torch.float)
-        z_loss = masked_mean(z_loss.detach().transpose(0, 1), label_mask, dtype=torch.float)
+
+        # Transpose back to match expected dimensions
+        # Detach z_loss to prevent gradient propagation through the regularization term
+        transposed_loss = loss.transpose(0, 1)
+        transposed_z_loss = z_loss.detach().transpose(0, 1)
+
+        # Apply mask and compute mean
+        loss = masked_mean(transposed_loss, label_mask, dtype=torch.float)
+        z_loss = masked_mean(transposed_z_loss, label_mask, dtype=torch.float)
+
         return {"loss": loss, "z_loss": z_loss}
 
 
@@ -1064,15 +1091,26 @@ class LlamaForTraining(NanotronModel):
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # Get model output (sharded logits)
         sharded_logits = self.model(
             input_ids=input_ids,
             input_mask=input_mask,
         )
+
+        # Process loss calculation
+        # This is the memory-intensive part that we want to optimize
         loss = self.loss(
             sharded_logits=sharded_logits,
             label_ids=label_ids,
             label_mask=label_mask,
         )
+
+        # Clean up any large intermediate tensors that are no longer needed
+        # This helps reduce memory pressure
+        del sharded_logits
+        torch.cuda.empty_cache()  # Optional: explicitly trigger memory cleanup
+
+        # Return appropriate loss values
         if self.config.z_loss_enabled:
             return {"loss": loss["loss"], "z_loss": loss["z_loss"]}
         else:

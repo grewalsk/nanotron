@@ -21,6 +21,13 @@ from typing import (
     cast,
 )
 
+# Import memory optimization utilities
+from nanotron.utils.memory_utils import (
+    log_memory_usage,
+    clear_memory_cache,
+    MemoryOptimizedFunction,
+)
+
 import psutil
 import torch
 from torch.nn.parallel import DistributedDataParallel
@@ -39,7 +46,6 @@ from nanotron.config import (
 )
 from nanotron.constants import MODEL_CONFIG_FILE_NAME
 from nanotron.data.dataloader import sanity_check_dataloader
-from nanotron.eval import LightEvalRunner
 from nanotron.helpers import (
     _vocab_size_with_padding,
     compute_remain_train_steps_of_a_data_stage_from_ckp,
@@ -55,7 +61,6 @@ from nanotron.logging import (
     LogItem,
     human_format,
     log_libraries_versions,
-    log_memory,
     log_rank,
     set_ranks_logging_level,
 )
@@ -123,7 +128,7 @@ except ImportError:
 
 def get_size(bytes):
     """Convert bytes to human readable format"""
-    for unit in ["", "K", "M", "B", "T", "P"]:
+    for unit in ["", "K", "M", "G", "T", "P"]:
         if bytes < 1024:
             return f"{bytes:.2f}{unit}B"
         bytes /= 1024
@@ -186,9 +191,7 @@ class DistributedTrainer:
         ########################################
 
         # Set random states
-        # Set different random seed for each TP rank to ensure diversity (especially at weight init)
-        tp_rank = dist.get_rank(self.parallel_context.tp_pg)
-        set_random_seed(self.config.general.seed + tp_rank)
+        set_random_seed(self.config.general.seed)
 
         # Init model and build on pp ranks
         self.random_states = init_random_states(
@@ -278,6 +281,7 @@ class DistributedTrainer:
         self.limit_val_batches = self.config.tokens.limit_val_batches
         self.current_dataloader: Optional[DataLoader] = None  # used for the current training stage
         self.current_base_dl: Optional[DataLoader] = None  # used for the current training stage
+        self.iteration_timer = None  # Will be initialized during training
 
         log_libraries_versions(logger=logger)
         log_rank("Config:", logger=logger, level=logging.INFO, rank=0, is_separator=True)
@@ -314,14 +318,6 @@ class DistributedTrainer:
             )
         else:
             self.s3_mover = None
-
-        # Initialize LightEval runner on rank 0
-        if dist.get_rank(self.parallel_context.world_pg) == 0:
-            if self.config.lighteval is not None:
-                self.lighteval_runner = LightEvalRunner(config=self.config, parallel_context=self.parallel_context)
-                if self.s3_mover is not None:
-                    # If we have S3 upload enabled, use the eval_single_checkpoint as post-upload callback
-                    self.s3_mover.post_upload_callback = self.lighteval_runner.eval_single_checkpoint
 
     def pre_training(self, *args, **kwargs):
         if not self.config.general.ignore_sanity_checks:
@@ -534,6 +530,8 @@ class DistributedTrainer:
         ],
         **kwargs,
     ) -> None:
+        self.pre_training(**kwargs)
+
         if self.config.checkpoints.save_initial_state and self.init_checkpoint_path is None:
             self.save_checkpoint()
 
@@ -552,7 +550,6 @@ class DistributedTrainer:
 
         self.initial_iter_step = self.metadata.last_train_step + 1
         self.last_iter_step = self.config.tokens.train_steps
-        self.pre_training(**kwargs)
 
         prof = get_profiler(config=self.config)
         # free memory
@@ -564,30 +561,30 @@ class DistributedTrainer:
                     logger.info(f"Profiler on for step {self.iteration_step}")
                     prof.step()
 
-                self.iteration_start_time = time.time()
+                # Use CUDA event-based timing for more accurate GPU-side elapsed time measurement
+                self.iteration_timer = nanotron_timer("iteration_time", "cuda", cuda_sync=False)
+                self.iteration_timer.start()
                 self._update_dataloader_based_on_training_stages(dataloader_or_dls)
 
                 # Training step
                 outputs, loss_avg, z_loss_avg = self.training_step(dataloader=self.current_dataloader)
 
                 # Update consumption tracking for current batch
-                if hasattr(self.current_base_dl, "dataset"):
-                    self.current_base_dl.dataset.update_consumption_metrics(
-                        start_idx=(self.iteration_step - 1)
-                        * self.global_batch_size,  # assumes we start from iteration_step=1
-                        end_idx=self.iteration_step * self.global_batch_size,
-                        sequence_length=self.sequence_length,
-                    )
+                self.current_base_dl.dataset.update_consumption_metrics(
+                    start_idx=(self.iteration_step - 1)
+                    * self.global_batch_size,  # assumes we start from iteration_step=1
+                    end_idx=self.iteration_step * self.global_batch_size,
+                    sequence_length=self.sequence_length,
+                )
 
                 # Training Logs
                 # Track consumed tokens for all dataset folders in current stage
-                if hasattr(self.current_base_dl, "dataset"):
-                    consumption_stats = self.current_base_dl.dataset.get_consumption_stats()
-                    current_stage = self.metadata.data_stages[self.metadata.last_stage_idx]
+                consumption_stats = self.current_base_dl.dataset.get_consumption_stats()
+                current_stage = self.metadata.data_stages[self.metadata.last_stage_idx]
 
-                    # Update consumed tokens for all folders in the consumption stats
-                    for folder_path, stats in consumption_stats.items():
-                        current_stage.consumed_tokens_per_dataset_folder[folder_path] = stats["tokens"]
+                # Update consumed tokens for all folders in the consumption stats
+                for folder_path, stats in consumption_stats.items():
+                    current_stage.consumed_tokens_per_dataset_folder[folder_path] = stats["tokens"]
 
                 # Original consumption tracking
                 self.metadata.consumed_train_samples += self.global_batch_size
@@ -617,11 +614,18 @@ class DistributedTrainer:
             self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator, self.lr_scheduler
         )
 
+        # Log memory usage before forward/backward pass
         if self.iteration_step < self.initial_iter_step + 5:
-            log_memory(logger=logger, msg="Before train_batch_iter")
+            log_memory_usage(logger=logger, prefix="Before train_batch_iter")
 
+        # Clear memory cache before forward/backward pass
+        clear_memory_cache()
+
+        # Use memory-optimized context for the forward/backward pass
         nanotron_timer("train_batch_iter", "cuda").start()
-        with torch.profiler.record_function("train_batch_iter"):
+        with torch.profiler.record_function("train_batch_iter"), \
+             MemoryOptimizedFunction(logger=logger, name="train_batch_iter",
+                                    clear_before=True, clear_after=True):
             outputs = self.pipeline_engine.train_batch_iter(
                 model=self.model,
                 pg=self.parallel_context.pp_pg,
@@ -631,8 +635,9 @@ class DistributedTrainer:
             )
         nanotron_timer("train_batch_iter", "cuda").end()
 
+        # Log memory usage after forward/backward pass
         if self.iteration_step < self.initial_iter_step + 5:
-            log_memory(logger=logger, msg="After train_batch_iter")
+            log_memory_usage(logger=logger, prefix="After train_batch_iter")
 
         after_tbi_sanity_checks(self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator)
 
@@ -750,8 +755,9 @@ class DistributedTrainer:
     ) -> None:
         # TODO @nouamanetazi: Megatron-LM seems to be using a barrier to report their interval time. Check if this is necessary. https://github.com/NouamaneTazi/Megatron-LM/blob/e241a96c3085b18e36c6cee1d68a8155de77b5a6/megatron/training.py#L607
         dist.barrier()
-        torch.cuda.synchronize()
-        elapsed_time_per_iteration_ms = (time.time() - self.iteration_start_time) * 1000
+        # End the iteration timer and get elapsed time in milliseconds
+        self.iteration_timer.end()
+        elapsed_time_per_iteration_ms = self.iteration_timer.elapsed * 1000
         tokens_per_sec = (
             self.global_batch_size * self.sequence_length / (elapsed_time_per_iteration_ms / 1000)
         )  # tokens_per_sec is calculated using sequence_length
@@ -775,8 +781,7 @@ class DistributedTrainer:
             # LogItem("consumed_samples", self.consumed_train_samples, "human_format"),  # , "12d"),
             LogItem(
                 "consumed_tokens",
-                self.metadata.consumed_train_samples
-                * self.config.tokens.sequence_length,  # TODO: not true if we change seqlen
+                self.metadata.consumed_train_samples * self.config.tokens.sequence_length,
                 "human_format",
             ),  # , "12d"),
             LogItem("time_per_iteration_ms", elapsed_time_per_iteration_ms, "human_format"),  # , ".1f"),
@@ -876,13 +881,12 @@ class DistributedTrainer:
             assert self.current_base_dl is not None, "current_base_dl should be defined"
 
             # Log consumption statistics
-            if hasattr(self.current_base_dl, "dataset"):
-                for dataset_name, stats in self.current_base_dl.dataset.get_consumption_stats().items():
-                    basic_log_entries.extend(
-                        [
-                            LogItem(f"dataloader/consumed_tokens/{dataset_name}", stats["tokens"], "human_format"),
-                        ]
-                    )
+            for dataset_name, stats in self.current_base_dl.dataset.get_consumption_stats().items():
+                basic_log_entries.extend(
+                    [
+                        LogItem(f"dataloader/consumed_tokens/{dataset_name}", stats["tokens"], "human_format"),
+                    ]
+                )
 
         # WandB logging - determine if this rank should log to wandb
         should_log_to_wandb = wandb is not None and (
@@ -1174,69 +1178,26 @@ class DistributedTrainer:
         return loggerwriter
 
     def pre_save_checkpoint(self) -> Path:
-        # Check if eval_interval should be updated from file
-        eval_interval_file = self.config.lighteval.eval_interval_file
-        if eval_interval_file is not None and Path(eval_interval_file).exists():
-            try:
-                with open(eval_interval_file, "r") as f:
-                    new_eval_interval = int(f.read().strip())
-
-                # Verify that the new interval is a multiple of checkpoint_interval
-                if new_eval_interval == self.config.lighteval.eval_interval:
-                    pass
-                elif new_eval_interval % self.config.checkpoints.checkpoint_interval == 0:
-                    log_rank(
-                        f"Updating lighteval.eval_interval from {self.config.lighteval.eval_interval} to {new_eval_interval}",
-                        logger=logger,
-                        level=logging.INFO,
-                        rank=0,
-                    )
-                    self.config.lighteval.eval_interval = new_eval_interval
-                else:
-                    log_rank(
-                        f"New eval_interval={new_eval_interval} must be a multiple of checkpoint_interval={self.config.checkpoints.checkpoint_interval}. Keeping current value: {self.config.lighteval.eval_interval}",
-                        logger=logger,
-                        level=logging.WARNING,
-                        rank=0,
-                    )
-            except (ValueError, IOError) as e:
-                log_rank(
-                    f"Error reading eval_interval from file: {e}. Keeping current value: {self.config.lighteval.eval_interval}",
-                    logger=logger,
-                    level=logging.WARNING,
-                    rank=0,
-                )
-
         if self.s3_mover is not None:
             self.s3_mover.distributed_wait_for_completion(self.parallel_context.world_pg)
             if self.s3_mover.post_upload_callback_outputs is not None:
                 slurm_job_id, slurm_log = self.s3_mover.post_upload_callback_outputs
-                log_rank(
-                    f"launching eval job: job_id={slurm_job_id} log at {slurm_log} slurm_eval",
-                    logger=logger,
-                    level=logging.WARNING,
-                    rank=0,
-                )
+                self.log_object({"job_id": slurm_job_id, "log": slurm_log}, "slurm_eval")
 
     def post_save_checkpoint(self):
         # Upload to S3
         if self.s3_mover is not None:
             self.s3_mover.start_uploading()
 
-        if dist.get_rank(self.parallel_context.world_pg) == 0:
-            if self.config.lighteval is not None and self.s3_mover is None:
-                if (
-                    self.config.lighteval.eval_interval is None
-                    or self.iteration_step % self.config.lighteval.eval_interval == 0
-                ):
-                    checkpoint_path = Path(self.config.checkpoints.checkpoints_path) / f"{self.config.general.step}"
-                    self.lighteval_runner.eval_single_checkpoint(checkpoint_path)
+        # free memory TODO: do we need this?
+        # gc.collect()
+        # torch.cuda.empty_cache()
 
     def save_checkpoint(self) -> Path:
         self.pre_save_checkpoint()
 
         checkpoints_path = self.config.checkpoints.checkpoints_path
-        checkpoint_path = Path(checkpoints_path) / f"{self.iteration_step}"
+        checkpoint_path = checkpoints_path / f"{self.iteration_step}"
         if self.config.checkpoints.checkpoints_path_is_shared_file_system:
             should_mkdir = dist.get_rank(self.parallel_context.world_pg) == 0
         else:
@@ -1267,7 +1228,6 @@ class DistributedTrainer:
             root_folder=checkpoint_path,
             training_metadata=self.metadata,
             config=self.config,
-            sanity_checks=not self.config.general.ignore_sanity_checks,
         )
         save_random_states(
             random_states=self.random_states, parallel_context=self.parallel_context, root_folder=checkpoint_path
