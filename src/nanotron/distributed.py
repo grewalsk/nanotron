@@ -260,8 +260,7 @@ def initialize_torch_distributed():
         torch.cuda.set_device(torch.cuda.device(device_id))
         backend = "nccl"
     else:
-        # TODO @thomasw21: Maybe figure out a way to do distributed `cpu` training at some point
-        raise NotImplementedError(f"CUDA was not found: torch.cuda.is_available(): {torch.cuda.is_available()}")
+        # For CPU-only training, use gloo backend
         backend = "gloo"
 
     # Call the init process.

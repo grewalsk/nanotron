@@ -184,6 +184,18 @@ We currently support the following features:
 - [x] Custom module checkpointing for large models
 - [x] Spectral µTransfer parametrization for scaling up neural networks
 - [x] Mamba example
+- [x] Opt-in tensor parallelism with TensorParallelMixin
+- [x] Flexible backend selection (NCCL, Gloo) based on hardware
+
+### Launching with Different Backends
+
+Nanotron supports different communication backends for distributed training:
+
+- **NCCL**: Recommended for GPU training (best performance)
+- **Gloo**: Useful for CPU-only training or debugging
+- **Auto**: Let Nanotron choose based on available hardware
+
+For examples on how to launch with different backends, see the [launch examples](examples/launch_examples/launch_with_backend.py).
 
 And we have on our roadmap:
 - [ ] FP8 training
