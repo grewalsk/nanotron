@@ -1,39 +1,50 @@
-<h1 align="center">⚡️ Nanotron</h1>
+# Nanotron with Memory Optimization
 
-<p align="center">
-    <a href="https://github.com/huggingface/nanotron/releases">
-        <img alt="GitHub release" src="https://img.shields.io/github/release/huggingface/nanotron.svg">
-    </a>
-    <a href="https://github.com/huggingface/nanotron/blob/master/LICENSE">
-        <img alt="License" src="https://img.shields.io/github/license/huggingface/nanotron.svg?color=green">
-    </a>
-</p>
+This repository contains a memory-optimized version of [Nanotron](https://github.com/huggingface/nanotron), focusing on reducing memory usage during loss computation.
 
-<h4 align="center">
-    <p>
-        <a href="#installation">Installation</a> •
-        <a href="#quick-start">Quick Start</a> •
-        <a href="#features">Features</a> •
-        <a href="#benchmarks">Benchmarks</a> •
-        <a href="CONTRIBUTING.md">Contributing</a>
-    <p>
-</h4>
+## Overview
 
-<h3 align="center">
-    <a href="https://huggingface.co/nanotron"><img style="float: middle; padding: 10px 10px 10px 10px;" width="60" height="55" src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.png" /></a>
-</h3>
-<h3 align="center">
-<p>Pretraining models made easy
-</h3>
+The memory optimizations target two main bottlenecks identified in the loss computation:
 
-Nanotron is a library for pretraining transformer models. It provides a simple and flexible API to pretrain models on custom datasets. Nanotron is designed to be easy to use, fast, and scalable. It is built with the following principles in mind:
+1. `src/nanotron/models/llama.py:876` (~4GB memory usage)
+2. `src/nanotron/parallel/tensor_parallel/functional.py:115:sharded_cross_entropy` (~4GB memory usage)
 
-- **Simplicity**: Nanotron is designed to be easy to use. It provides a simple and flexible API to pretrain models on custom datasets.
-- **Performance**: Optimized for speed and scalability, Nanotron uses the latest techniques to train models faster and more efficiently.
+These optimizations use techniques such as:
+- Memory buffers for temporary tensors
+- In-place operations where possible
+- Explicit tensor cleanup
+- Reduced tensor duplication
 
-📚 **Check out our [Ultrascale Playbook](https://huggingface.co/spaces/nanotron/ultrascale-playbook)** - A comprehensive guide to efficiently scale LLM training with Nanotron!
+## Memory Optimizations
 
-## Installation
+The main optimizations are in:
+
+- `src/nanotron/parallel/tensor_parallel/functional.py`: Optimized `sharded_cross_entropy` function
+- `src/nanotron/models/llama.py`: Optimized Loss class
+- `src/nanotron/utils/memory_utils.py`: New memory utilities
+- `src/nanotron/trainer.py`: Memory-optimized training loop
+
+## Testing on Google Colab
+
+To test the memory optimizations on Google Colab:
+
+1. Install this package:
+   ```python
+   !pip install git+https://github.com/grewalsk/nanotron-memory-optimized.git
+   ```
+
+2. Download and run the memory profile test:
+   ```python
+   !wget https://raw.githubusercontent.com/grewalsk/nanotron-memory-optimized/main/memory_profile_test.py
+   !wget https://raw.githubusercontent.com/grewalsk/nanotron-memory-optimized/main/analyze_memory_snapshot.py
+   !python memory_profile_test.py
+   ```
+
+## Expected Results
+
+The memory optimizations should reduce memory usage during loss computation by approximately 50%, from around 10GB to 5GB or less.
+
+## Original Nanotron Installation
 
 To run the code in this project, first create a Python virtual environment using e.g. `uv`:
 
@@ -173,7 +184,18 @@ We currently support the following features:
 - [x] Custom module checkpointing for large models
 - [x] Spectral µTransfer parametrization for scaling up neural networks
 - [x] Mamba example
-- [x] CUDA event-based timing for accurate GPU performance measurement
+- [x] Opt-in tensor parallelism with TensorParallelMixin
+- [x] Flexible backend selection (NCCL, Gloo) based on hardware
+
+### Launching with Different Backends
+
+Nanotron supports different communication backends for distributed training:
+
+- **NCCL**: Recommended for GPU training (best performance)
+- **Gloo**: Useful for CPU-only training or debugging
+- **Auto**: Let Nanotron choose based on available hardware
+
+For examples on how to launch with different backends, see the [launch examples](examples/launch_examples/launch_with_backend.py).
 
 And we have on our roadmap:
 - [ ] FP8 training

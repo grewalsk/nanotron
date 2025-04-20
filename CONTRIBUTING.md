@@ -222,3 +222,49 @@ $ pytest -n 12 tests
 
 You can specify a smaller set of tests in order to test only the feature
 you're working on.
+
+## Tensor Parallelism Guide
+
+When contributing to the tensor parallelism functionality in Nanotron, please follow these guidelines:
+
+### The ParallelContext API
+- Always use the `get_global_rank()` method to get global ranks instead of directly indexing into `world_rank_matrix`.
+- The deprecated usage: `parallel_context.world_rank_matrix[ep_rank, pp_rank, dp_rank, cp_rank, tp_rank]`
+- The new usage: 
+```python
+parallel_context.get_global_rank(
+    expert_parallel_rank=ep_rank,
+    pipeline_parallel_rank=pp_rank,
+    data_parallel_rank=dp_rank,
+    context_parallel_rank=cp_rank,
+    tensor_parallel_rank=tp_rank
+)
+```
+
+### Implementing Tensor Parallelism in Models
+
+1. **Opt-in Model Support**:
+   - Set `supports_tensor_parallel = True` at the model class level
+   - Inherit from `TensorParallelMixin` before inheriting from the base model class
+
+   ```python
+   from nanotron.parallel.tensor_parallel.nn import TensorParallelMixin
+   from nanotron.models import NanotronModel
+   
+   class YourModel(TensorParallelMixin, NanotronModel):
+       supports_tensor_parallel = True
+       # Model implementation...
+   ```
+
+2. **Tensor Parallel Initialization**:
+   - Call `_init_tensor_parallel()` in your model's initialization
+   - Implement tensor-parallel-specific logic in the method
+
+3. **Tensor Parallel Components**:
+   - Use `TensorParallelColumnLinear` for column-parallel linear layers (split on output dimension)
+   - Use `TensorParallelRowLinear` for row-parallel linear layers (split on input dimension)
+   - Use `TensorParallelEmbedding` for embedding matrices
+
+4. **Tensor Parallel Plan**:
+   - Define which components will be tensor-parallelized
+   - Decide between row-wise vs. column-wise sharding for each layer

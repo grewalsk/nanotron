@@ -27,7 +27,7 @@ class NanotronModel(nn.Module, metaclass=ABCMeta):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.parallel_context: "ParallelContext"
+        self.parallel_context: "ParallelContext" = kwargs.get("parallel_context", None)
         self.config: "NanotronConfigs"
         self.module_id_to_prefix: dict[int, str]
 
@@ -38,6 +38,10 @@ class NanotronModel(nn.Module, metaclass=ABCMeta):
         # Useful mapping to get param names
         self.module_id_to_prefix = {id(module): f"{module_name}." for module_name, module in self.named_modules()}
         self.module_id_to_prefix[id(self)] = ""
+        
+        # Initialize tensor parallelism if the model supports it
+        if hasattr(self, "_init_tensor_parallel"):
+            self._init_tensor_parallel(self.parallel_context)
 
     def get_named_params_with_correct_tied(self) -> Iterator[Tuple[str, "NanotronParameter"]]:
         """Return named parameters with correct tied params names.

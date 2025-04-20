@@ -49,12 +49,13 @@ class MambaTrainer(DistributedTrainer):
                 (
                     target,
                     (
-                        parallel_context.world_rank_matrix[
-                            dist.get_rank(parallel_context.ep_pg),
-                            get_pp_rank_of(target, module=model),
-                            dist.get_rank(parallel_context.dp_pg),
-                            dist.get_rank(parallel_context.tp_pg),
-                        ],
+                        parallel_context.get_global_rank(
+                            expert_parallel_rank=dist.get_rank(parallel_context.ep_pg),
+                            pipeline_parallel_rank=get_pp_rank_of(target, module=model),
+                            data_parallel_rank=dist.get_rank(parallel_context.dp_pg),
+                            context_parallel_rank=dist.get_rank(parallel_context.cp_pg),
+                            tensor_parallel_rank=dist.get_rank(parallel_context.tp_pg),
+                        ),
                     ),
                 )
                 for target in embeddings_lm_head_tied_names

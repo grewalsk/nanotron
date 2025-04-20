@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import Dict, Literal
 
 import numpy as np
@@ -42,7 +43,29 @@ class ParallelContext:
 
         self.set_device()
 
-        assert backend == "nccl", "Only nccl backend is supported for now."
+        # Handle backend selection based on available hardware
+        if torch.cuda.is_available():
+            if backend != "nccl":
+                warnings.warn(
+                    f"Switching backend from {backend} to nccl for GPU execution. "
+                    "NCCL is recommended for GPU training.",
+                    UserWarning
+                )
+                backend = "nccl"
+        elif backend == "nccl":
+            warnings.warn(
+                "NCCL backend requested but no GPUs available, using gloo instead. "
+                "Note that tensor parallelism with size > 1 requires NCCL and GPUs.",
+                UserWarning
+            )
+            backend = "gloo"
+            
+        # Verify that tensor parallelism > 1 is only used with NCCL and GPUs
+        if tensor_parallel_size > 1 and (backend != "nccl" or not torch.cuda.is_available()):
+            raise ValueError(
+                f"Tensor parallelism with size > 1 requires NCCL backend and GPU availability. "
+                f"Got backend={backend} and CUDA available={torch.cuda.is_available()}"
+            )
 
         if not dist.is_initialized():
             dist.initialize_torch_distributed()
@@ -108,7 +131,8 @@ class ParallelContext:
         #     ]
         # )
 
-        self.world_rank_matrix: np.ndarray = ranks
+        # Store the internal rank matrix
+        self._world_rank_matrix: np.ndarray = ranks
         self.parallel_order = ["ep", "pp", "dp", "cp", "tp"]
 
     def create_new_group(self, all_groups_ranks: np.ndarray) -> dist.ProcessGroup:
@@ -133,15 +157,49 @@ class ParallelContext:
     def set_device(self):
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
 
-        # NOTE: Set the device id.
-        # `torch.cuda.device_count` should return the number of device on a single node.
-        # We assume the nodes to be homogeneous (same number of gpus per node)
-        device_id = local_rank
-        torch.cuda.set_device(torch.cuda.device(device_id))
+        # Check if CUDA is available before setting device
+        if torch.cuda.is_available():
+            # NOTE: Set the device id.
+            # `torch.cuda.device_count` should return the number of device on a single node.
+            # We assume the nodes to be homogeneous (same number of gpus per node)
+            device_id = local_rank
+            torch.cuda.set_device(torch.cuda.device(device_id))
+        else:
+            # On CPU-only machines, no device setting is needed
+            pass
 
+    @property
+    def world_rank_matrix(self) -> np.ndarray:
+        """
+        Access to the world rank matrix (DEPRECATED).
+        
+        Warning:
+            Direct access to world_rank_matrix is deprecated and will be removed in
+            a future version. Use get_global_rank() method instead.
+        
+        Returns:
+            The world rank matrix as a numpy array
+        """
+        warnings.warn(
+            "Direct access to world_rank_matrix is deprecated and will be removed in a future version. "
+            "Use get_global_rank() method instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        return self._world_rank_matrix
+    
     def get_local_ranks(self, world_rank: int) -> Dict[str, int]:
-        # return tuple(i.item() for i in np.where(self.world_rank_matrix == world_rank))
-        local_ranks = np.where(self.world_rank_matrix == world_rank)
+        """
+        Get local ranks in each parallel dimension for a given global rank.
+        
+        Args:
+            world_rank: The global rank to get local ranks for
+            
+        Returns:
+            Dictionary mapping parallel dimensions to local ranks
+        """
+        # return tuple(i.item() for i in np.where(self._world_rank_matrix == world_rank))
+        local_ranks = np.where(self._world_rank_matrix == world_rank)
         return {ax: local_ranks[i].item() for i, ax in enumerate(self.parallel_order)}
 
     def destroy(self):
@@ -153,21 +211,28 @@ class ParallelContext:
 
     def get_global_rank(
         self,
-        ep_rank: int,
-        pp_rank: int,
-        dp_rank: int,
-        cp_rank: int,
-        tp_rank: int,
-    ) -> np.int64:
+        expert_parallel_rank: int,
+        pipeline_parallel_rank: int,
+        data_parallel_rank: int,
+        context_parallel_rank: int,
+        tensor_parallel_rank: int,
+    ) -> int:
+        """Return the global process rank from the world_rank_matrix.
+        
+        Args:
+            expert_parallel_rank: Rank in the expert parallel group
+            pipeline_parallel_rank: Rank in the pipeline parallel group
+            data_parallel_rank: Rank in the data parallel group
+            context_parallel_rank: Rank in the context parallel group
+            tensor_parallel_rank: Rank in the tensor parallel group
+            
+        Returns:
+            int: The global process rank
         """
-        Get the global rank based on the specified ranks in different parallel groups.
-
-        :param ep_rank: int, Rank in the expert parallel group.
-        :param pp_rank: int, Rank in the pipeline parallel group.
-        :param dp_rank: int, Rank in the data parallel group.
-        :param cp_rank: int, Rank in the context parallel group.
-        :param tp_rank: int, Rank in the tensor parallel group.
-
-        :return: numpy.int64, The global rank.
-        """
-        return self.world_rank_matrix[ep_rank, pp_rank, dp_rank, cp_rank, tp_rank]
+        return int(self.world_rank_matrix[
+            expert_parallel_rank,
+            pipeline_parallel_rank,
+            data_parallel_rank,
+            context_parallel_rank,
+            tensor_parallel_rank
+        ])

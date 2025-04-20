@@ -43,6 +43,34 @@ from nanotron.parallel.tied_parameters import create_tied_parameter
 logger = get_logger(__name__)
 
 
+class TensorParallelMixin:
+    """Mixin class that enables tensor parallelism for model classes.
+    
+    Models that want to participate in tensor parallelism should:
+    1. Set supports_tensor_parallel = True at the class level
+    2. Inherit from this mixin before inheriting from the base model class
+    3. Call _init_tensor_parallel() as part of their initialization
+    """
+    
+    supports_tensor_parallel = False
+    
+    def _init_tensor_parallel(self, parallel_context=None):
+        """Initialize tensor parallelism for this model.
+        
+        Args:
+            parallel_context: The ParallelContext object that manages different process groups
+        """
+        if not hasattr(self, "supports_tensor_parallel") or not self.supports_tensor_parallel:
+            return
+            
+        if parallel_context is None or parallel_context.tensor_parallel_size <= 1:
+            return
+            
+        # Implementation will be model-specific and should be done in subclasses
+        # This method serves as a hook that should be called in model initialization
+        pass
+
+
 class TensorParallelColumnLinear(nn.Linear):
     def __init__(
         self,
